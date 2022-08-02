@@ -108,13 +108,13 @@ async def get_pods_for_service(service, namespace=None):
 
     for pod in pods:
         if pod.metadata.labels:
-            match = True
-
-            for key in selector:
-                if (key not in pod.metadata.labels or
-                        pod.metadata.labels[key] != selector[key]):
-                    match = False
-                    break
+            match = not any(
+                (
+                    key not in pod.metadata.labels
+                    or pod.metadata.labels[key] != selector[key]
+                )
+                for key in selector
+            )
 
             if match:
                 matches.append(pod)
@@ -137,9 +137,8 @@ async def get_services_for_route(route, namespace=None):
     async def verify_has_pods(backend):
         if backend.kind == 'Service' and backend.weight != 0:
             service = await get_service(backend.name, namespace)
-            if service:
-                if await get_pods_for_service(service, namespace):
-                    services.append(service)
+            if service and await get_pods_for_service(service, namespace):
+                services.append(service)
 
     await verify_has_pods(primary)
 
@@ -155,9 +154,7 @@ def public_address(route):
 
     host = route.spec.host
     path = route.spec.path or '/'
-    if route.spec.tls:
-        return 'https://%s%s' % (host, path)
-    return 'http://%s%s' % (host, path)
+    return f'https://{host}{path}' if route.spec.tls else f'http://{host}{path}'
 
 async def get_backends(namespace=None):
     # We find backends by looking for a 'type' label on either services
@@ -180,34 +177,38 @@ async def get_backends(namespace=None):
 
     if services is not None:
         for service in services.items:
-            if service.metadata.labels:
-                if 'type' in service.metadata.labels:
-                    if service.metadata.labels['type'] == 'parksmap-backend':
-                        if await get_pods_for_service(service, namespace):
-                            port = service.spec.ports[0].port
-                            name = service.metadata.name
-                            url = 'http://%s:%s/' % (name, port)
-                            backends.append((name, url))
-                            names.add(name)
+            if (
+                service.metadata.labels
+                and 'type' in service.metadata.labels
+                and service.metadata.labels['type'] == 'parksmap-backend'
+                and await get_pods_for_service(service, namespace)
+            ):
+                port = service.spec.ports[0].port
+                name = service.metadata.name
+                url = f'http://{name}:{port}/'
+                backends.append((name, url))
+                names.add(name)
 
     routes = await get_routes(namespace)
 
     if routes is not None:
         for route in routes.items:
-            if route.metadata.labels:
-                if 'type' in route.metadata.labels:
-                    if route.metadata.labels['type'] == 'parksmap-backend':
-                        if await get_services_for_route(route, namespace):
-                            name = route.metadata.name
-                            url = public_address(route)
-                            if name not in names:
-                                backends.append((name, url))
-                                names.add(name)
+            if (
+                route.metadata.labels
+                and 'type' in route.metadata.labels
+                and route.metadata.labels['type'] == 'parksmap-backend'
+                and await get_services_for_route(route, namespace)
+            ):
+                name = route.metadata.name
+                url = public_address(route)
+                if name not in names:
+                    backends.append((name, url))
+                    names.add(name)
 
     return backends
 
 async def get_backend_info(url):
-    url = url + 'ws/info/'
+    url = f'{url}ws/info/'
 
     async with ClientSession() as session:
         async with session.get(url) as response:
@@ -239,22 +240,25 @@ def broadcast_message(topic, info):
     manager = sockjs.get_manager('clients', app)
 
     for session in manager.sessions:
-        if not session.expired:
-            if hasattr(session, 'subscriptions'):
-                if topic in session.subscriptions:
-                    subscription = session.subscriptions[topic]
+        if (
+            not session.expired
+            and hasattr(session, 'subscriptions')
+            and topic in session.subscriptions
+        ):
+            subscription = session.subscriptions[topic]
 
-                    headers = {}
-                    headers['subscription'] = subscription
-                    headers['content-type'] = 'application/json'
-                    headers['message-id'] = str(uuid.uuid1())
+            headers = {
+                'subscription': subscription,
+                'content-type': 'application/json',
+                'message-id': str(uuid.uuid1()),
+            }
 
-                    body = json.dumps(info).encode('UTF-8')
+            body = json.dumps(info).encode('UTF-8')
 
-                    frame = StompFrame(command='MESSAGE',
-                            headers=headers, body=body)
+            frame = StompFrame(command='MESSAGE',
+                    headers=headers, body=body)
 
-                    session.send(bytes(frame).decode('UTF-8'))
+            session.send(bytes(frame).decode('UTF-8'))
 
 async def poll_backends():
     global backend_details
@@ -267,12 +271,12 @@ async def poll_backends():
         # Get the list of services with our label.
 
         try:
-            default_backend = os.environ.get('PARKSMAP_BACKEND')
+            if default_backend := os.environ.get('PARKSMAP_BACKEND'):
+                endpoints = [
+                    (backend, f'http://{backend}:8080/')
+                    for backend in default_backend.split(',')
+                ]
 
-            if default_backend:
-                endpoints = []
-                for backend in default_backend.split(','):
-                    endpoints.append((backend, 'http://%s:8080/' % backend))
             else:
                 endpoints = await get_backends()
 
@@ -361,14 +365,9 @@ def socks_backend(msg, session):
 
     manager = sockjs.get_manager('clients', app)
 
-    if msg.tp == sockjs.MSG_OPEN:
-        pass
-
-    elif msg.tp == sockjs.MSG_MESSAGE:
+    if msg.tp != sockjs.MSG_OPEN and msg.tp == sockjs.MSG_MESSAGE:
         if frame.command == 'CONNECT':
-            headers = {}
-            headers['session'] = session.id
-
+            headers = {'session': session.id}
             msg = StompFrame(command='CONNECTED', headers=headers)
 
             session.send(bytes(msg).decode('UTF-8'))
@@ -381,12 +380,6 @@ def socks_backend(msg, session):
 
         elif frame.command == 'UNSUBSCRIBE':
             del session.subscriptions[frame.headers['destination']]
-
-    elif msg.tp == sockjs.MSG_CLOSE:
-        pass
-
-    elif msg.tp == sockjs.MSG_CLOSED:
-        pass
 
 sockjs.add_endpoint(app, socks_backend, name='clients', prefix='/socks-backends/')
 
@@ -402,7 +395,7 @@ async def data_all(request):
     service = request.rel_url.query['service']
 
     name, url, info = backend_details[service]
-    url =  url + 'ws/data/all'
+    url = f'{url}ws/data/all'
 
     # XXX Need to find a better way of doing this. It currently reads
     # the whole data set into memory before returning it. Need to work
@@ -423,7 +416,7 @@ async def data_within(request):
     service = request.rel_url.query['service']
 
     name, url, info = backend_details[service]
-    url = url + 'ws/data/within'
+    url = f'{url}ws/data/within'
 
     # XXX Need to find a better way of doing this. It currently reads
     # the whole data set into memory before returning it. Need to work
